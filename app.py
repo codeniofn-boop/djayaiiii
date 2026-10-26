@@ -62,7 +62,7 @@ import engine
 #  provider's API.  It is never written to disk, logged, or exposed to the
 #  browser.  If you paste it here, do NOT commit this file to a public repo.
 #
-API_KEY = ""   # <-- paste your key here, e.g. "r8_..."  (or use the env var)
+API_KEY = "" r8_IHgYV6bYmLvoC1ZRsxLQCU4twjkG8900q1RB2 
 
 # Which generative backend to use: "auto" picks the cloud provider when a
 # key is present and falls back to the offline engine otherwise.
