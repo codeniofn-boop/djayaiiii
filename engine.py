@@ -2,32 +2,46 @@
 engine.py - DJAYAIIII core audio engine
 =======================================
 
-A zero-dependency tech-house remix engine written with nothing but the
-Python standard library (wave, math, struct, array, io, operator, itertools).
-There is nothing to pip-install: if Python 3.8+ runs, this runs.
+A zero-dependency audio toolkit written with nothing but the Python standard
+library (wave, math, struct, array, io, operator, itertools).  There is
+nothing to pip-install: if Python 3.8+ runs, this runs.
 
 Speed: every per-sample operation is pushed down into C-level builtins
 (array, map, operator, slicing, struct).  Instruments are rendered once as
 short templates and tiled across the track, so a full-length remix renders
 in a few seconds instead of freezing the process in a Python for-loop.
 
+Two layers live here:
+
+  * A tiny synth (kick + square sub-bass) and a tech-house remixer that
+    works fully offline - used when no generative-AI key is configured.
+  * Stem tools used by app.py to assemble AI-generated instrumentals with
+    the isolated vocals of any song: decoding, resampling, seam-joining,
+    transient ducking, stem mixing and mastering.
+
 Public API
 ----------
 generate_tech_house_backing(duration_secs, bpm=126, sample_rate=44100)
     -> array('d') of mono float samples in [-1.0, 1.0]
-       Kick on every beat, square-wave sub-bass on every off-beat.
 
 remix_track(vocal_wav_bytes, bpm=126, sample_rate=44100, source_bpm=None,
             intro_bars=2, outro_bars=2)
-    -> bytes of a finished 16-bit stereo WAV file.
-       Reads the uploaded WAV, stretches it onto the BPM grid, sidechains
-       it against the kick, mixes it with the backing and masters it.
+    -> bytes of a finished 16-bit stereo WAV (offline tech-house remix)
+
+decode_wav(wav_bytes, mono=True)
+    -> (array('d') | [array('d') per channel], sample_rate)
+
+resample(samples, src_rate, dst_rate)        -> array('d')
+fit_length(samples, n)                       -> array('d') trimmed / zero-padded
+butt_join(chunks, sample_rate, fade_secs)    -> array('d') click-free concatenation
+transient_duck_envelope(trigger, sample_rate, ...) -> array('d') gain curve
+mix_stems(vocal_channels, inst_channels, sample_rate, ...) -> [array('d'), ...]
 
 samples_to_wav_bytes(samples, sample_rate=44100, stereo=True)
-    -> bytes   float samples -> normalised 16-bit WAV file.
+    -> bytes   float samples (mono array, or [left, right]) -> mastered WAV
 
 render_backing_wav(duration_secs, bpm=126, sample_rate=44100)
-    -> bytes   quick preview of just the backing track.
+    -> bytes   quick preview of just the synth backing track.
 """
 
 import io
@@ -72,6 +86,17 @@ SIDECHAIN_RELEASE = 0.26     # seconds to swell back to full volume
 VOCAL_GAIN = 0.85            # vocal level (after peak normalisation)
 MASTER_PEAK = 0.95           # final peak level of the mastered mix
 MAX_GRID_STRETCH = 0.25      # never stretch a vocal more than +/-25%
+
+# Transient ducking (used when laying vocals over an AI instrumental):
+# every hit in the instrumental pulls the vocal down to DUCK_FLOOR for a
+# moment, then it swells back - genre-agnostic "glue".
+DUCK_FLOOR = 0.5
+DUCK_HOLD = 0.03             # seconds
+DUCK_RELEASE = 0.18          # seconds
+DUCK_BLOCK = 1024            # samples per analysis block (~23ms at 44.1k)
+DUCK_ONSET_RATIO = 2.2       # block must be this many times the running average
+DUCK_MIN_LEVEL = 0.02        # ignore "hits" quieter than this (mean |x|)
+DUCK_MIN_GAP = 0.08          # seconds between two detected hits
 
 _CHUNK = 1 << 20             # samples per block in the resampler
 
@@ -230,8 +255,8 @@ def render_backing_wav(duration_secs, bpm=126, sample_rate=44100):
 # WAV in / out
 # ---------------------------------------------------------------------------
 
-def _decode_wav(wav_bytes):
-    """WAV bytes -> (array('d') of mono floats in [-1, 1], sample_rate)."""
+def _decode_wav_ints(wav_bytes):
+    """WAV bytes -> (array of ints, channels, full_scale, sample_rate)."""
     try:
         with wave.open(io.BytesIO(wav_bytes), "rb") as w:
             channels = w.getnchannels()
@@ -240,7 +265,7 @@ def _decode_wav(wav_bytes):
             raw = w.readframes(w.getnframes())
     except (wave.Error, EOFError, struct.error) as exc:
         raise ValueError(
-            "Could not read that WAV file (%s). Export the vocal as a standard "
+            "Could not read that WAV file (%s). Export the audio as a standard "
             "PCM WAV (16-bit or 24-bit) and try again." % exc
         ) from None
 
@@ -266,40 +291,79 @@ def _decode_wav(wav_bytes):
         full_scale = 2147483648.0
     else:
         raise ValueError("Unsupported WAV sample width: %d bytes" % width)
+    return ints, channels, full_scale, rate
 
-    if channels > 1:                                       # fold down to mono
-        mono = ints[0::channels]
+
+def decode_wav(wav_bytes, mono=True):
+    """
+    WAV bytes -> (samples, sample_rate).
+
+    mono=True  : one array('d') of floats in [-1, 1] (channels folded down).
+    mono=False : a list with one array('d') per channel (1 = mono, 2 = L/R).
+    Accepts 8/16/24/32-bit PCM at any sample rate and channel count.
+    """
+    ints, channels, full_scale, rate = _decode_wav_ints(wav_bytes)
+    if mono:
+        summed = ints[0::channels] if channels > 1 else ints
         for c in range(1, channels):
-            mono = map(operator.add, mono, ints[c::channels])
-        ints = mono
+            summed = map(operator.add, summed, ints[c::channels])
+        scale = 1.0 / (full_scale * channels)
+        return array("d", map(operator.mul, summed, repeat(scale))), rate
+    scale = 1.0 / full_scale
+    chans = []
+    for c in range(channels):
+        chan = ints[c::channels] if channels > 1 else ints
+        chans.append(array("d", map(operator.mul, chan, repeat(scale))))
+    return chans, rate
 
-    scale = 1.0 / (full_scale * channels)
-    return array("d", map(operator.mul, ints, repeat(scale))), rate
+
+def _decode_wav(wav_bytes):
+    """Backwards-compatible alias: mono decode."""
+    return decode_wav(wav_bytes, mono=True)
 
 
 def samples_to_wav_bytes(samples, sample_rate=44100, stereo=True):
     """
     Master float samples to a 16-bit WAV file.
 
-    Peak-normalises to MASTER_PEAK (so nothing can clip) and writes a
-    stereo file by default, which every player and DAW accepts.
+    `samples` is either one mono array (written to both channels when
+    stereo=True) or a [left, right] pair of arrays for true stereo.
+    Peak-normalises to MASTER_PEAK so nothing can clip.
     """
-    if not isinstance(samples, array):
-        samples = array("d", samples)
-    peak = max(map(abs, samples), default=0.0)
-    gain = (MASTER_PEAK / peak) if peak > 0.0 else 1.0
-    pcm = array("h", map(int, map(operator.mul, samples, repeat(gain * 32767.0))))
-
-    if stereo:
-        frames = array("h", bytes(len(pcm) * 4))
-        frames[0::2] = pcm
-        frames[1::2] = pcm
+    if isinstance(samples, (list, tuple)) and samples and isinstance(samples[0], array):
+        if len(samples) == 1:                       # [mono] -> mono
+            samples = samples[0]
+        elif len(samples) > 2:
+            raise ValueError("samples_to_wav_bytes takes one array or [left, right]")
+    if isinstance(samples, (list, tuple)):
+        left, right = samples
+        n = min(len(left), len(right))
+        left, right = left[:n], right[:n]
+        peak = max(max(map(abs, left), default=0.0), max(map(abs, right), default=0.0))
+        gain = (MASTER_PEAK / peak) if peak > 0.0 else 1.0
+        k = repeat(gain * 32767.0)
+        frames = array("h", bytes(n * 4))
+        frames[0::2] = array("h", map(int, map(operator.mul, left, k)))
+        frames[1::2] = array("h", map(int, map(operator.mul, right, k)))
+        channels = 2
     else:
-        frames = pcm
+        if not isinstance(samples, array):
+            samples = array("d", samples)
+        peak = max(map(abs, samples), default=0.0)
+        gain = (MASTER_PEAK / peak) if peak > 0.0 else 1.0
+        pcm = array("h", map(int, map(operator.mul, samples, repeat(gain * 32767.0))))
+        if stereo:
+            frames = array("h", bytes(len(pcm) * 4))
+            frames[0::2] = pcm
+            frames[1::2] = pcm
+            channels = 2
+        else:
+            frames = pcm
+            channels = 1
 
     buf = io.BytesIO()
     with wave.open(buf, "wb") as w:
-        w.setnchannels(2 if stereo else 1)
+        w.setnchannels(channels)
         w.setsampwidth(2)
         w.setframerate(int(sample_rate))
         w.writeframes(_native(frames))
@@ -357,6 +421,135 @@ def _grid_stretch_ratio(vocal_secs, bpm):
         beats = max(1, int(round(vocal_secs / beat)))
         ratio = beats * beat / vocal_secs
     return min(1.0 + MAX_GRID_STRETCH, max(1.0 - MAX_GRID_STRETCH, ratio))
+
+
+def resample(samples, src_rate, dst_rate):
+    """Convert `samples` from src_rate to dst_rate (linear interpolation)."""
+    if int(src_rate) == int(dst_rate):
+        return samples
+    return _resample(samples, float(src_rate) / float(dst_rate))
+
+
+def fit_length(samples, n):
+    """Trim or zero-pad `samples` to exactly n samples."""
+    if len(samples) == n:
+        return samples
+    if len(samples) > n:
+        return samples[:n]
+    return samples + array("d", bytes(8 * (n - len(samples))))
+
+
+def butt_join(chunks, sample_rate, fade_secs=0.03):
+    """
+    Concatenate audio chunks end to end with a short fade at every seam.
+
+    No overlap is used, so the total length is exactly the sum of the
+    chunks and anything time-aligned to them (like a vocal) stays in sync.
+    """
+    chunks = [c for c in chunks if len(c)]
+    if not chunks:
+        return array("d")
+    fade = max(1, int(fade_secs * sample_rate))
+    out = array("d")
+    last = len(chunks) - 1
+    for idx, chunk in enumerate(chunks):
+        chunk = array("d", chunk)
+        f = min(fade, len(chunk) // 2)
+        if f and idx > 0:                                     # fade in
+            ramp = map(operator.mul, range(f), repeat(1.0 / f))
+            chunk[:f] = array("d", map(operator.mul, chunk[:f], ramp))
+        if f and idx < last:                                  # fade out
+            ramp = map(operator.mul, range(f, 0, -1), repeat(1.0 / f))
+            chunk[-f:] = array("d", map(operator.mul, chunk[-f:], ramp))
+        out.extend(chunk)
+    return out
+
+
+def transient_duck_envelope(trigger, sample_rate, floor=DUCK_FLOOR,
+                            hold=DUCK_HOLD, release=DUCK_RELEASE):
+    """
+    Build a per-sample gain curve from the hits in `trigger` (mono array).
+
+    Every detected transient (kick, snare, stab) pulls the gain down to
+    `floor`, holds it, then swells back to 1.0 over `release` seconds -
+    a genre-agnostic sidechain that works with any instrumental.
+    """
+    n = len(trigger)
+    block = DUCK_BLOCK
+    n_blocks = (n + block - 1) // block
+    block_secs = block / float(sample_rate)
+    min_gap = max(1, int(DUCK_MIN_GAP / block_secs))
+
+    # 1. coarse loudness per block (mean |x|), all C-level
+    levels = []
+    for b in range(n_blocks):
+        seg = trigger[b * block:(b + 1) * block]
+        levels.append(sum(map(abs, seg)) / len(seg))
+
+    # 2. detect onsets against a running average, then shape the gain
+    gains = []
+    avg = 0.0                          # running average; 0 lets a hit on block 0 fire
+    since = 1e9                        # seconds since the last hit
+    last_hit = -min_gap
+    for b, lvl in enumerate(levels):
+        if (lvl > DUCK_MIN_LEVEL and lvl > DUCK_ONSET_RATIO * avg
+                and b - last_hit >= min_gap):
+            since = 0.0
+            last_hit = b
+        if since < hold:
+            g = floor
+        elif since < hold + release:
+            x = (since - hold) / release
+            g = floor + (1.0 - floor) * (1.0 - (1.0 - x) ** 2)
+        else:
+            g = 1.0
+        gains.append(g)
+        avg += 0.12 * (lvl - avg)
+        since += block_secs
+    gains.append(1.0)
+
+    # 3. expand to per-sample with a linear ramp inside each block
+    env = array("d")
+    for b in range(n_blocks):
+        g0, g1 = gains[b], gains[b + 1]
+        size = min(block, n - b * block)
+        env.extend(map(operator.add, repeat(g0, size),
+                       map(operator.mul, range(size), repeat((g1 - g0) / block))))
+    return env
+
+
+def mix_stems(vocal_channels, inst_channels, sample_rate,
+              vocal_gain=0.9, inst_gain=0.8, duck_floor=DUCK_FLOOR):
+    """
+    Lay isolated vocals over an instrumental.
+
+    Both inputs are lists of channel arrays at `sample_rate` (1 or 2 each).
+    The instrumental's transients duck the vocal (see transient_duck_envelope)
+    so the two sit together instead of fighting.  Returns [left, right].
+    """
+    def stereo(chs):
+        return [chs[0], chs[0]] if len(chs) == 1 else [chs[0], chs[1]]
+
+    vox = stereo(vocal_channels)
+    inst = stereo(inst_channels)
+    n = max(len(vox[0]), len(inst[0]))
+    vox = [fit_length(c, n) for c in vox]
+    inst = [fit_length(c, n) for c in inst]
+
+    # normalise each stem to a known peak before balancing
+    vpeak = max(max(map(abs, vox[0]), default=0.0), max(map(abs, vox[1]), default=0.0)) or 1.0
+    ipeak = max(max(map(abs, inst[0]), default=0.0), max(map(abs, inst[1]), default=0.0)) or 1.0
+
+    mono_inst = array("d", map(operator.mul, map(operator.add, inst[0], inst[1]), repeat(0.5 / ipeak)))
+    env = transient_duck_envelope(mono_inst, sample_rate, floor=duck_floor)
+    env = array("d", map(operator.mul, env, repeat(vocal_gain / vpeak)))
+
+    out = []
+    for c in range(2):
+        ducked = map(operator.mul, vox[c], env)
+        bed = map(operator.mul, inst[c], repeat(inst_gain / ipeak))
+        out.append(array("d", map(operator.add, ducked, bed)))
+    return out
 
 
 # ---------------------------------------------------------------------------
