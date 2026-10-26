@@ -52,17 +52,28 @@ import engine
 #  API AUTHENTICATION
 # ===========================================================================
 #
-#  Paste your generative-audio API key between the quotes below, OR (safer)
-#  leave it empty and export it as an environment variable before starting:
+#  RECOMMENDED: create a file called `.env` next to app.py (it is listed in
+#  .gitignore, so it can never be committed) containing one line:
+#
+#      REPLICATE_API_TOKEN=r8_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+#
+#  or export it as an environment variable before starting:
 #
 #      export REPLICATE_API_TOKEN="r8_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 #      python app.py
 #
+#  You can also paste the key between the quotes below for a quick local
+#  test, but then do NOT commit this file: anything committed to GitHub is
+#  in the repo history forever, and a leaked key can run up your bill.
+#
 #  The key is only ever sent as an Authorization header over HTTPS to the
 #  provider's API.  It is never written to disk, logged, or exposed to the
-#  browser.  If you paste it here, do NOT commit this file to a public repo.
+#  browser.
 #
-API_KEY = "" r8_IHgYV6bYmLvoC1ZRsxLQCU4twjkG8900q1RB2 
+#  Run `python app.py --check` to verify the key and the model schemas
+#  before paying for a render.
+#
+API_KEY = ""   # <-- paste your key here, e.g. "r8_..."  (or use .env / the env var)
 
 # Which generative backend to use: "auto" picks the cloud provider when a
 # key is present and falls back to the offline engine otherwise.
@@ -90,8 +101,26 @@ HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8000"))
 
 
+def _load_dotenv():
+    """Load KEY=value lines from a `.env` file next to app.py, if present."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+    except OSError:
+        pass
+
+
+_load_dotenv()
+
+
 def api_key():
-    """The configured key: hard-coded placeholder first, then env var."""
+    """The configured key: hard-coded placeholder first, then env / .env."""
     return (API_KEY or os.environ.get("REPLICATE_API_TOKEN", "")).strip()
 
 
@@ -277,6 +306,28 @@ def _collect_uris(output):
     return found
 
 
+def stem_inputs():
+    """Desired inputs for the stem-separation model (filtered per version)."""
+    return {
+        ("output_format", "format"): "wav",
+        "model": "htdemucs",
+        "shifts": 1,
+    }
+
+
+def music_inputs(prompt, duration):
+    """Desired inputs for the music-generation model (filtered per version)."""
+    return {
+        "prompt": prompt,
+        "model_version": MUSICGEN_VARIANT,
+        "duration": duration,
+        "continuation": False,
+        "output_format": "wav",
+        "normalization_strategy": "loudness",
+        "seed": GENERATION_SEED,
+    }
+
+
 # ===========================================================================
 #  Providers
 # ===========================================================================
@@ -314,11 +365,7 @@ class ReplicateProvider(GenerativeProvider):
         song_url = c.upload_file(song_bytes, filename, ctype)
 
         progress("stems", "Isolating vocals and melody (stem separation)", 0.08)
-        inputs = c.build_input(STEM_MODEL, {
-            ("output_format", "format"): "wav",
-            "model": "htdemucs",
-            "shifts": 1,
-        })
+        inputs = c.build_input(STEM_MODEL, stem_inputs())
         inputs[c.audio_field(STEM_MODEL)] = song_url
         pred = c.create_prediction(STEM_MODEL, inputs)
         pred = c.wait(pred, lambda s: progress("stems", "Stem separation: %s" % s, 0.12))
@@ -368,15 +415,7 @@ class ReplicateProvider(GenerativeProvider):
             progress("generate", "Uploading melody section %d/%d" % (i + 1, n_win), 0.22 + 0.1 * i / n_win)
             ref_wav = engine.samples_to_wav_bytes(melody[a:b], m_rate, stereo=False)
             ref_url = c.upload_file(ref_wav, "melody_%02d.wav" % i, "audio/wav")
-            inputs = c.build_input(MUSIC_MODEL, {
-                "prompt": prompt,
-                "model_version": MUSICGEN_VARIANT,
-                "duration": int(min(WINDOW_SECS, math.ceil(win_secs))),
-                "continuation": False,
-                "output_format": "wav",
-                "normalization_strategy": "loudness",
-                "seed": GENERATION_SEED,
-            })
+            inputs = c.build_input(MUSIC_MODEL, music_inputs(prompt, int(min(WINDOW_SECS, math.ceil(win_secs)))))
             inputs[c.audio_field(MUSIC_MODEL)] = ref_url
             preds.append((c.create_prediction(MUSIC_MODEL, inputs), b - a))
 
@@ -787,6 +826,34 @@ INDEX_HTML = r"""<!doctype html>
 #  Entry point
 # ===========================================================================
 
+def preflight():
+    """`python app.py --check`: verify the key and model schemas, spend nothing."""
+    key = api_key()
+    if not key:
+        print("No API key found. Put REPLICATE_API_TOKEN=... in a .env file next to app.py.")
+        return 1
+    print("key: %s...%s (%d chars)" % (key[:3], key[-4:], len(key)))
+    try:
+        c = ReplicateClient(key)
+        acct = c._json("GET", "/account")
+        print("account: %s (%s)" % (acct.get("username"), acct.get("type")))
+        for label, model, desired in (
+            ("stem model ", STEM_MODEL, stem_inputs()),
+            ("music model", MUSIC_MODEL, music_inputs("<style prompt>", WINDOW_SECS)),
+        ):
+            version, props = c.model_info(model)
+            sent = c.build_input(model, desired)
+            sent[c.audio_field(model)] = "<audio file>"
+            print("%s: %s @ %s" % (label, model, version[:12]))
+            print("   schema fields: %s" % ", ".join(sorted(props)))
+            print("   will send    : %s" % json.dumps(sent))
+    except ProviderError as exc:
+        print("FAILED: %s" % exc)
+        return 1
+    print("OK - ready to render.")
+    return 0
+
+
 def main():
     provider = make_provider()
     print("DJAYAIIII  ->  http://localhost:%d" % PORT)
@@ -802,4 +869,6 @@ def main():
 
 
 if __name__ == "__main__":
+    if "--check" in sys.argv:
+        sys.exit(preflight())
     main()
